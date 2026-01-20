@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 import agentlightning as agl
 from openai import AsyncOpenAI
 
-from rollout import Task, run_rollout, OpenAIClient
+from rollout import Task, run_rollout, OpenAIClient, GeminiClient, create_llm_client, APIProvider
 from dataset import Dataset, create_classification_dataset
 from prompt_template import CLASSIFICATION_SYSTEM_PROMPT
 import apo_ko_setup  # 한국어 POML 패치용
@@ -28,7 +28,15 @@ logging.getLogger("agentlightning").setLevel(logging.CRITICAL)
 load_dotenv()
 
 # --- 설정 ---
-MODEL_NAME = "gpt-5-mini"
+# API Provider 선택: "openai" 또는 "google"
+API_PROVIDER: APIProvider = "openai"
+
+# 모델 설정 (None이면 provider 기본값 사용)
+# OpenAI: gpt-4.1-mini, gpt-5-mini, gpt-4o 등
+# Google: gemini-2.0-flash, gemini-1.5-pro, gemini-1.5-flash 등
+MODEL_NAME = "gpt-5-mini"  # OpenAI 사용 시
+# MODEL_NAME = "gemini-2.0-flash"  # Google 사용 시
+
 RANDOM_SEED = 42
 BEAM_ROUNDS = 1
 BEAM_WIDTH = 1
@@ -125,7 +133,7 @@ async def classification_agent(task: dict, prompt_template: agl.PromptTemplate) 
     else:
         task_obj.system_prompt = str(prompt_template)
 
-    async with OpenAIClient(model=MODEL_NAME) as client:
+    async with create_llm_client(provider=API_PROVIDER, model=MODEL_NAME) as client:
         _, reward = await run_rollout(task_obj, client)
 
     return reward
@@ -139,7 +147,7 @@ async def evaluate_prompt_on_dataset(prompt_template, dataset_tasks: list[dict])
         prompt_str = str(prompt_template)
 
     rewards = []
-    async with OpenAIClient(model=MODEL_NAME) as client:
+    async with create_llm_client(provider=API_PROVIDER, model=MODEL_NAME) as client:
         for task_item in dataset_tasks:
             try:
                 task_obj = Task(
@@ -234,6 +242,8 @@ def main():
     dataset_train, dataset_val = load_train_val_dataset()
     test_tasks = get_test_dataset()
 
+    print(f"API Provider: {API_PROVIDER}")
+    print(f"모델: {MODEL_NAME}")
     print(f"학습 데이터: {len(dataset_train)}개")
     print(f"검증 데이터: {len(dataset_val)}개")
     print(f"테스트 데이터: {len(test_tasks)}개")

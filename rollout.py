@@ -1,8 +1,9 @@
 # rollout.py
 import os
 import json
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional, List, Sequence
+from typing import Optional, List, Sequence, Literal
 
 import asyncio
 from dotenv import load_dotenv
@@ -15,8 +16,12 @@ from prompt_template import CLASSIFICATION_SYSTEM_PROMPT, format_judge_prompt
 
 load_dotenv()
 
-# --- OpenAI 설정 ---
-API_KEY = os.getenv("OPENAI_API_KEY")
+# --- API 설정 ---
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+
+# API Provider 타입
+APIProvider = Literal["openai", "google"]
 
 
 # --- 태스크 정의 ---
@@ -43,21 +48,56 @@ class JudgeResponse(BaseModel):
     score: float = Field(description="0-1 스케일의 점수. 엄격하게 평가하세요.")
 
 
-# --- LLM 클라이언트 ---
-class OpenAIClient:
-    def __init__(self, model: str = "gpt-4.1-mini"):
-        self.client = AsyncOpenAI(api_key=API_KEY)
+# --- LLM 클라이언트 베이스 ---
+class BaseLLMClient(ABC):
+    """LLM 클라이언트 추상 베이스 클래스"""
+
+    def __init__(self, model: str):
         self.model = model
 
     async def __aenter__(self):
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()
+        return False
+
+    @abstractmethod
+    async def close(self) -> None:
+        """클라이언트 리소스 정리"""
+        pass
+
+    @abstractmethod
+    async def _call_with_retry(
+        self, messages: Sequence[ChatCompletionMessageParam]
+    ) -> str:
+        """Rate limit을 고려한 LLM 호출"""
+        pass
+
+    async def classify(self, task: Task) -> str:
+        system_prompt = task.system_prompt or CLASSIFICATION_SYSTEM_PROMPT
+
+        messages: List[ChatCompletionMessageParam] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": task.question},
+        ]
+
+        return await self._call_with_retry(messages)
+
+
+# --- OpenAI 클라이언트 ---
+class OpenAIClient(BaseLLMClient):
+    """OpenAI API 클라이언트"""
+
+    def __init__(self, model: str = "gpt-4.1-mini"):
+        super().__init__(model)
+        self.client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+    async def close(self) -> None:
         try:
             await self.client.close()
         except Exception:
             pass
-        return False
 
     async def _call_with_retry(
         self, messages: Sequence[ChatCompletionMessageParam]
@@ -89,19 +129,113 @@ class OpenAIClient:
 
         return ""
 
-    async def classify(self, task: Task) -> str:
-        system_prompt = task.system_prompt or CLASSIFICATION_SYSTEM_PROMPT
 
-        messages: List[ChatCompletionMessageParam] = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": task.question},
-        ]
+# --- Google Gemini 클라이언트 ---
+class GeminiClient(BaseLLMClient):
+    """Google Gemini API 클라이언트"""
 
-        return await self._call_with_retry(messages)
+    def __init__(self, model: str = "gemini-2.0-flash"):
+        super().__init__(model)
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=GOOGLE_API_KEY)
+            self.genai = genai
+            self.client = genai.GenerativeModel(model)
+        except ImportError:
+            raise ImportError(
+                "google-generativeai 패키지가 필요합니다. "
+                "pip install google-generativeai 로 설치하세요."
+            )
+
+    async def close(self) -> None:
+        # Gemini 클라이언트는 별도 정리 불필요
+        pass
+
+    async def _call_with_retry(
+        self, messages: Sequence[ChatCompletionMessageParam]
+    ) -> str:
+        """Rate limit을 고려한 LLM 호출"""
+        max_retries = 5
+        wait_time = 2
+
+        # OpenAI 형식 메시지를 Gemini 형식으로 변환
+        gemini_contents = self._convert_messages(messages)
+
+        for attempt in range(max_retries):
+            try:
+                # Gemini는 동기 API이므로 asyncio.to_thread 사용
+                response = await asyncio.to_thread(
+                    self.client.generate_content,
+                    gemini_contents
+                )
+                return response.text.strip() if response.text else ""
+            except Exception as e:
+                error_str = str(e).lower()
+                if "rate" in error_str or "quota" in error_str or "429" in error_str:
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(wait_time)
+                        wait_time *= 2
+                    else:
+                        raise
+                else:
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(wait_time)
+                        wait_time *= 2
+                    else:
+                        raise
+
+        return ""
+
+    def _convert_messages(
+        self, messages: Sequence[ChatCompletionMessageParam]
+    ) -> List[dict]:
+        """OpenAI 형식 메시지를 Gemini 형식으로 변환"""
+        gemini_contents = []
+        system_instruction = ""
+
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+
+            if role == "system":
+                # 시스템 메시지는 첫 번째 사용자 메시지에 prepend
+                system_instruction = content
+            elif role == "user":
+                if system_instruction:
+                    content = f"{system_instruction}\n\n---\n\n{content}"
+                    system_instruction = ""
+                gemini_contents.append({"role": "user", "parts": [content]})
+            elif role == "assistant":
+                gemini_contents.append({"role": "model", "parts": [content]})
+
+        return gemini_contents
+
+
+# --- 클라이언트 팩토리 함수 ---
+def create_llm_client(
+    provider: APIProvider = "openai",
+    model: Optional[str] = None
+) -> BaseLLMClient:
+    """
+    API provider에 따라 적절한 LLM 클라이언트를 생성합니다.
+
+    Args:
+        provider: "openai" 또는 "google"
+        model: 모델명 (None이면 기본값 사용)
+
+    Returns:
+        BaseLLMClient 인스턴스
+    """
+    if provider == "openai":
+        return OpenAIClient(model=model or "gpt-4.1-mini")
+    elif provider == "google":
+        return GeminiClient(model=model or "gemini-2.0-flash")
+    else:
+        raise ValueError(f"지원하지 않는 provider: {provider}. 'openai' 또는 'google'을 사용하세요.")
 
 
 # --- LLM Judge ---
-async def llm_judge(client: OpenAIClient, task: Task, predicted: str) -> float:
+async def llm_judge(client: BaseLLMClient, task: Task, predicted: str) -> float:
     """
     LLM을 사용하여 분류 결과를 평가합니다.
     apo_custom_algorithm.py의 llm_judge 패턴을 따릅니다.
@@ -156,7 +290,7 @@ async def llm_judge(client: OpenAIClient, task: Task, predicted: str) -> float:
 
 
 # --- 롤아웃 함수 ---
-async def run_rollout(task: Task, client: OpenAIClient) -> tuple[str, float]:
+async def run_rollout(task: Task, client: BaseLLMClient) -> tuple[str, float]:
     """
     단일 롤아웃 실행:
     1) 분류 실행
